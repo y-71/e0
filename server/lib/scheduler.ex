@@ -2,21 +2,19 @@ defmodule HLSServer.Scheduler do
   use GenServer
 
   @video_dir "data"
-  @rss_url "https://archive.org/services/collection-rss.php?collection=anime_miscellaneous"
-  @saved_urls_path "ucberkeley-webcast.json"
+  @rss_url "https://archive.org/services/collection-rss.php?collection=computerchronicles"
+  @saved_urls_path (@rss_url |> String.split("collection=") |> List.last()) <> ".json"
 
   def start_link(_) do
     GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
   end
 
-  def init() do
+  def init(_) do
     HTTPoison.start()
     saved_urls = get_saved_urls(@saved_urls_path)
-    saved_urls_hash = hash(saved_urls)
+    saved_urls_hash = hash(Enum.join(saved_urls, ","))
 
     {:ok, %{
-      rss_url: @rss_url,
-      saved_urls_path: @saved_urls_path,
       saved_urls: saved_urls,
       saved_urls_hash: saved_urls_hash
     }}
@@ -35,7 +33,7 @@ defmodule HLSServer.Scheduler do
   def fetch_latest_videos do
     state = GenServer.call(__MODULE__, :get_state)
 
-    with {:ok, rss_string} <- get_rss_string(state.rss_url),
+    with {:ok, rss_string} <- get_rss_string(@rss_url),
          {:ok, map_of_rss} <- FastRSS.parse_rss(rss_string) do
       items = map_of_rss["items"]
       urls =
@@ -43,11 +41,12 @@ defmodule HLSServer.Scheduler do
         |> Enum.map(& &1["extensions"]["media"]["content"])
         |> List.flatten()
         |> Enum.map(& &1["attrs"]["url"])
+        |> Enum.reject(&is_nil/1)  # Removes nil values
 
-      urls_hash = hash(urls)
+      urls_hash = hash(Enum.join(urls, ","))
 
       if state.saved_urls_hash != urls_hash do
-        File.write!(state.saved_urls_path, Poison.encode!(urls))
+        File.write!(@saved_urls_path, Poison.encode!(urls))
         {:ok, urls}
       else
         {:ok, state.saved_urls}
@@ -70,15 +69,20 @@ defmodule HLSServer.Scheduler do
     end
   end
 
-  defp download!(url, filepath \\ "buffer.mp4") do
+  defp download!(url) do
+    download!(url, @video_dir <> "/" <> hash(url))
+  end
+
+  defp download!(url, filepath) do
     File.rm(filepath)
     {_, exit_status} = System.cmd("aria2c", ["-x", "16", "-s", "16", "-o", filepath, url], into: IO.stream(:stdio, :line))
     if exit_status == 0, do: filepath, else: raise "Download failed with exit status #{exit_status}"
   end
 
-  def convert_to_hls(input_path, output_dir \\ @video_dir) do
+  def convert_to_hls(input_path, output_dir \\ @video_dir <> "/hls") do
     File.mkdir_p!(output_dir)
-    output_m3u8 = Path.join(output_dir, "stream.m3u8")
+    stream_name = hash(input_path)
+    output_m3u8 = Path.join(output_dir, stream_name <> ".m3u8")
 
     ffmpeg_command = [
       "-i", input_path,
@@ -86,7 +90,7 @@ defmodule HLSServer.Scheduler do
       "-start_number", "0",
       "-hls_time", HLSServer.Stream.target_duration(),
       "-hls_list_size", "0",
-      "-hls_segment_filename", Path.join(output_dir, "segment_%03d.ts"),
+      "-hls_segment_filename", Path.join(output_dir, stream_name<> "_segment_%03d.ts"),
       output_m3u8
     ]
 
@@ -103,5 +107,5 @@ defmodule HLSServer.Scheduler do
     end
   end
 
-  defp hash(list), do: :crypto.hash(:sha256, Enum.join(list, ",")) |> Base.encode16()
+  defp hash(object), do: :crypto.hash(:sha256, object) |> Base.encode16()
 end
